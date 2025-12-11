@@ -1,4 +1,5 @@
 #version 450
+precision highp float;
 
 layout(location = 0) in vec2 fragTexCoord;
 layout(location = 0) out vec4 outColor;
@@ -9,7 +10,6 @@ layout(binding = 2) uniform sampler2D texImageBg;
 layout(binding = 3) uniform sampler2D texDepthBg;
 layout(binding = 4) uniform sampler2D texMask;
 
-// UBO 保持不变
 layout(binding = 5) uniform UBO {
     float height, steady, focus, zoom;
     float isometric, dolly, invert, mirror;
@@ -21,51 +21,102 @@ layout(binding = 5) uniform UBO {
     float gray, pad1, pad2, pad3;
 } u;
 
-// 纹理采样 (保持不变)
-vec4 gtexture(sampler2D tex, vec2 uv, float mirror) {
-    if (mirror > 0.5) uv = abs(fract(uv * 0.5 + 0.5) * 2.0 - 1.0);
-    else uv = clamp(uv, 0.0, 1.0);
-    return texture(tex, uv);
+// 镜像采样
+vec4 gtexture(sampler2D tex, vec2 uv) {
+    vec2 mUV = abs(fract(uv * 0.5 + 0.5) * 2.0 - 1.0);
+    return textureLod(tex, mUV, 0.0);
 }
 
-struct RayResult { vec2 uv; float val; float steep; bool oob; };
+// 获取深度
+float getDepth(sampler2D map, vec2 uv, float inv) {
+    vec2 mUV = abs(fract(uv * 0.5 + 0.5) * 2.0 - 1.0);
+    float d = textureLod(map, mUV, 0.0).r;
+    if(inv > 0.5) d = 1.0 - d;
+    return d;
+}
 
-// 核心算法 (保持你原本正常的逻辑)
-RayResult RayMarch(vec2 uv, vec2 dir, sampler2D depthMap, float mirror, float h, float inv) {
+struct RayResult { vec2 uv; float val; float steep; };
+
+// 核心视差算法
+RayResult RayMarch(vec2 uv, vec2 dir, sampler2D depthMap, float h, float inv) {
     RayResult res;
-    res.uv = uv; res.oob = false;
-    int steps = int(mix(30.0, 60.0, u.quality));
+    res.uv = uv;
+
+    // 动态步数 (限制最大步数防止过载)
+    float offsetLen = length(u.offset);
+    float qualityMod = mix(30.0, 80.0, u.quality);
+    int steps = int(qualityMod + min(offsetLen, 2.0) * 40.0);
+    steps = min(steps, 80);
+
     float stepSize = 1.0 / float(steps);
     vec2 delta = dir * h * 0.5;
-    float lastH = 0.0;
 
+    vec2 currUV = uv;
+    float currRayH = 1.0;
+    float prevRayH = 1.0;
+    float currD = 0.0;
+    float prevD = 0.0;
+    int hitIndex = -1;
+
+    // 1. 线性搜索
     for(int i=0; i<steps; i++) {
-        float t = float(i) * stepSize;
-        vec2 curUV = uv + delta * t;
-        float d = texture(depthMap, curUV).r;
-        if(inv > 0.5) d = 1.0 - d;
-        float rayH = 1.0 - t;
-        if(rayH < d) { // Hit
-            float weight = (d - rayH) / ((d - rayH) - (lastH - (rayH + stepSize)) + 0.0001);
-            res.uv = uv + delta * (t - stepSize * weight);
-            res.val = d;
+        currD = getDepth(depthMap, currUV, inv);
+        currRayH = 1.0 - float(i) * stepSize;
+        if(currRayH < currD) {
+            hitIndex = i;
             break;
         }
-        lastH = d;
-        res.uv = curUV;
+        prevRayH = currRayH;
+        prevD = currD;
+        currUV += delta * stepSize;
     }
 
-    // 既然你手机支持这个，就保留它，这是效果最好的
-    float dx = dFdx(res.val); float dy = dFdy(res.val);
-    res.steep = sqrt(dx*dx + dy*dy) * 10.0;
+    // 2. 二分查找
+    if(hitIndex != -1) {
+        vec2 uvBefore = currUV - delta * stepSize;
+        vec2 uvAfter = currUV;
+        float hBefore = prevRayH;
+        float hAfter = currRayH;
+        vec2 finalUV = uvAfter;
+        float finalD = currD;
 
-    if(res.uv.x < 0.0 || res.uv.x > 1.0 || res.uv.y < 0.0 || res.uv.y > 1.0) res.oob = true;
+        for(int j=0; j<5; j++) {
+            vec2 midUV = mix(uvBefore, uvAfter, 0.5);
+            float midRayH = mix(hBefore, hAfter, 0.5);
+            float midD = getDepth(depthMap, midUV, inv);
+            if(midRayH < midD) {
+                uvAfter = midUV;
+                hAfter = midRayH;
+                finalUV = midUV;
+                finalD = midD;
+            } else {
+                uvBefore = midUV;
+                hBefore = midRayH;
+            }
+        }
+        res.uv = finalUV;
+        res.val = finalD;
+    } else {
+        res.uv = currUV;
+        res.val = currD;
+    }
+
+    // === [关键修复] 安全的撕裂计算 ===
+    float dx = getDepth(depthMap, res.uv + vec2(0.01, 0.0), inv);
+    float dy = getDepth(depthMap, res.uv + vec2(0.0, 0.01), inv);
+    float gradient = length(vec2(dx - res.val, dy - res.val));
+
+    // 逻辑修正：
+    // 1. min(offsetLen, 1.0): 无论你拖多远，系数最大只能算作 1.0。
+    //    这防止了大幅拖动时数值爆炸导致的“全屏空白”。
+    // 2. * 6.0: 降低敏感度 (之前是 15.0 太大了)。
+    float safeOffset = min(offsetLen, 1.0);
+    res.steep = gradient * safeOffset * 6.0;
+
     return res;
 }
 
 void main() {
-    // === 1. UV 适配 (保持你原本正常的逻辑) ===
-    // 之前改这里导致了平铺问题，现在改回来
     float scrRatio = u.screenSize.x / u.screenSize.y;
     float imgRatio = u.imgSize.x / u.imgSize.y;
     float fitRatio = scrRatio / imgRatio;
@@ -75,49 +126,45 @@ void main() {
     uv /= u.zoom;
     vec2 baseUV = uv + 0.5;
 
-    // 黑边裁切
     if(baseUV.x < 0.0 || baseUV.x > 1.0 || baseUV.y < 0.0 || baseUV.y > 1.0) {
         outColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
-    // === 2. 视差计算 ===
     vec2 rayDir = -u.offset;
-    rayDir += vec2(sin(u.time*0.5), cos(u.time*0.4)) * 0.01 * u.steady;
+    // 移除呼吸动画，保证初始居中
     rayDir += uv * u.focus * 0.1;
 
-    // 前景计算
-    RayResult fg = RayMarch(baseUV, rayDir, texDepth, u.mirror, u.height, u.invert);
+    RayResult fg = RayMarch(baseUV, rayDir, texDepth, u.height, u.invert);
+    RayResult bg = RayMarch(baseUV, rayDir, texDepthBg, u.height, u.invert);
 
-    // === 3. 背景计算 (关键修改点！) ===
-    // [PC逻辑复刻]
-    // 1. 背景不要乘 0.5，要和前景完全同步 (rayDir)
-    // 2. 强制 mirror = 1.0
-    vec2 bgDir = rayDir;
-    RayResult bg = RayMarch(baseUV, bgDir, texDepthBg, 1.0, u.height, u.invert);
+    vec4 cFG = gtexture(texImage, fg.uv);
+    vec4 cBG = gtexture(texImageBg, bg.uv);
 
-    // 获取颜色
-    vec4 cFG = gtexture(texImage, fg.uv, u.mirror);
-    vec4 cBG = gtexture(texImageBg, bg.uv, 1.0); // 背景强制镜像
-
-    // === 4. 混合遮罩 (保持你原本正常的逻辑) ===
-    float mOrg = texture(texMask, baseUV).r;
-    float mDst = texture(texMask, fg.uv).r;
+    // 混合遮罩
+    float mOrg = gtexture(texMask, baseUV).r;
+    float mDst = gtexture(texMask, fg.uv).r;
     float subj = max(mOrg, mDst);
+    subj = smoothstep(0.1, 0.6, subj);
 
-    // PC 端的阈值微调
-    float inpaint = max(u.inpaint, 0.05); // 防止为0
-    float baseM = smoothstep(inpaint, inpaint+0.1, fg.steep);
+    // 提高 inpaint 基础阈值，防止细微抖动穿帮
+    float inpaint = max(u.inpaint, 0.15);
 
-    // 主体区域保护 (Steepness 容忍度 x3)
-    float subjM = smoothstep(inpaint*3.0, inpaint*3.0+0.3, fg.steep);
+    float baseM = smoothstep(inpaint, inpaint + 0.2, fg.steep);
 
-    float mask = mix(baseM, subjM, smoothstep(0.2, 0.5, subj));
+    // 主体保护：极大提高阈值
+    // 在主体区域内，steep 必须超过 2.0 (极难达到) 才会显示背景
+    // 这样保证雕像实体非常稳固
+    float subjM = smoothstep(2.0, 3.0, fg.steep);
 
-    if(fg.oob) {
-        if(subj < 0.5) mask = 1.0;
-        else mask = mix(0.0, 1.0, smoothstep(0.5, 0.8, fg.steep));
+    float mask = mix(baseM, subjM, subj);
+
+    vec4 finalColor = mix(cFG, cBG, mask);
+
+    if(u.sat > 0.1 && u.sat != 1.0) {
+        vec3 gray = vec3(dot(finalColor.rgb, vec3(0.299, 0.587, 0.114)));
+        finalColor.rgb = mix(gray, finalColor.rgb, u.sat);
     }
 
-    outColor = mix(cFG, cBG, mask);
+    outColor = finalColor;
 }
