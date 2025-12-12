@@ -43,10 +43,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private volatile boolean isTouching = false; // 用于控制呼吸动画暂停
 
     // 灵敏度配置
-    private final float TOUCH_SENSITIVITY = 0.002f;
-    private final float GYRO_SENSITIVITY = 1.5f; // 陀螺仪灵敏度
+    private final float TOUCH_SENSITIVITY = 0.004f;
+    private final float GYRO_SENSITIVITY = 6.0f; // 陀螺仪灵敏度
     private final float BREATH_SPEED = 1.5f;     // 呼吸速度
-    private final float BREATH_AMP = 0.15f;      // 呼吸幅度 (位移量)
+    private final float BREATH_AMP = 0.6f;      // 呼吸幅度 (位移量)
 
     private volatile boolean isRunning = false;
     private ScaleGestureDetector scaleDetector;
