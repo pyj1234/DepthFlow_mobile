@@ -84,6 +84,7 @@ RayResult RayMarch(vec2 uv, vec2 dir, sampler2D depthMap, float h, float inv) {
             vec2 midUV = mix(uvBefore, uvAfter, 0.5);
             float midRayH = mix(hBefore, hAfter, 0.5);
             float midD = getDepth(depthMap, midUV, inv);
+
             if(midRayH < midD) {
                 uvAfter = midUV;
                 hAfter = midRayH;
@@ -101,17 +102,24 @@ RayResult RayMarch(vec2 uv, vec2 dir, sampler2D depthMap, float h, float inv) {
         res.val = currD;
     }
 
-    // === [关键修复] 安全的撕裂计算 ===
-    float dx = getDepth(depthMap, res.uv + vec2(0.01, 0.0), inv);
-    float dy = getDepth(depthMap, res.uv + vec2(0.0, 0.01), inv);
-    float gradient = length(vec2(dx - res.val, dy - res.val));
+    // === [修复] 优化锯齿状拉伸 ===
+    // 使用像素级采样而非固定的 0.01，解决边缘粗糙问题
+    vec2 px = vec2(0.002);
+    if(u.imgSize.x > 0.0) px = 1.0 / u.imgSize;
 
-    // 逻辑修正：
-    // 1. min(offsetLen, 1.0): 无论你拖多远，系数最大只能算作 1.0。
-    //    这防止了大幅拖动时数值爆炸导致的“全屏空白”。
-    // 2. * 6.0: 降低敏感度 (之前是 15.0 太大了)。
+    // 使用中心差分计算梯度 (更平滑)
+    float d_l = getDepth(depthMap, res.uv - vec2(px.x, 0.0), inv);
+    float d_r = getDepth(depthMap, res.uv + vec2(px.x, 0.0), inv);
+    float d_u = getDepth(depthMap, res.uv - vec2(0.0, px.y), inv);
+    float d_d = getDepth(depthMap, res.uv + vec2(0.0, px.y), inv);
+
+    float gradX = abs(d_l - d_r);
+    float gradY = abs(d_u - d_d);
+    float gradient = max(gradX, gradY);
+
     float safeOffset = min(offsetLen, 1.0);
-    res.steep = gradient * safeOffset * 6.0;
+    // 提高灵敏度系数以适配更精细的采样 (6.0 -> 25.0)
+    res.steep = gradient * safeOffset * 25.0;
 
     return res;
 }
@@ -147,15 +155,23 @@ void main() {
     float subj = max(mOrg, mDst);
     subj = smoothstep(0.1, 0.6, subj);
 
-    // 提高 inpaint 基础阈值，防止细微抖动穿帮
+    // 提高 inpaint 基础阈值
     float inpaint = max(u.inpaint, 0.15);
 
     float baseM = smoothstep(inpaint, inpaint + 0.2, fg.steep);
 
-    // 主体保护：极大提高阈值
-    // 在主体区域内，steep 必须超过 2.0 (极难达到) 才会显示背景
-    // 这样保证雕像实体非常稳固
-    float subjM = smoothstep(2.0, 3.0, fg.steep);
+    // === [修复] 优化主体拉伸保护 ===
+    // 降低保护阈值，当检测到明显撕裂时，允许背景显示，切断拉伸
+    float safeThreshold = inpaint + 0.35;
+    float subjM = smoothstep(safeThreshold, safeThreshold + 0.5, fg.steep);
+
+    // 额外的拉伸保护: 如果像素偏移过远，强制使用背景
+    float stretchDist = distance(fg.uv, baseUV);
+    float limit = length(u.offset) * u.height * 2.0;
+    if(limit > 0.0 && stretchDist > limit) {
+        subjM = 1.0;
+        baseM = 1.0;
+    }
 
     float mask = mix(baseM, subjM, subj);
 
@@ -165,6 +181,7 @@ void main() {
         vec3 gray = vec3(dot(finalColor.rgb, vec3(0.299, 0.587, 0.114)));
         finalColor.rgb = mix(gray, finalColor.rgb, u.sat);
     }
+
 
     outColor = finalColor;
 }

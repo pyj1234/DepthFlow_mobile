@@ -6,9 +6,8 @@
     "isometric": 0.0,
     "offset_x": 0.0,
     "offset_y": 0.0,
-    "animation_type": "orbital",
     "resolution": [
-        1920,
-        1080
+        4096,
+        3072
     ]
 }
